@@ -5,11 +5,18 @@ import {
   ButtonStyle,
   Client,
   ComponentType,
+  ContainerBuilder,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  MessageFlags,
+  SectionBuilder,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
+  TextDisplayBuilder,
+  ThumbnailBuilder,
   type Message,
   type TextChannel,
 } from 'discord.js';
@@ -20,32 +27,54 @@ import path from 'path';
 import 'dotenv/config';
 
 /* ══════════════════════════════════════════════════════════════════════
-   CONFIG & CONSTANTS
+   CONFIG
    ══════════════════════════════════════════════════════════════════════ */
 
 const COLORS = {
-  jellyfin: 0xaa5cc3,
-  jellyfinLive: 0x10b981,
-  proxmox: 0xe57000,
+  neutral: 0x2b2d31,
   success: 0x57f287,
   danger: 0xed4245,
   warn: 0xfaa61a,
-  neutral: 0x2b2d31,
-  paused: 0x80848e,
+  proxmox: 0xe57000,
 } as const;
 
-const JELLYFIN_LOGO =
-  'https://upload.wikimedia.org/wikipedia/commons/thumb/4/4b/Jellyfin_logo.svg/512px-Jellyfin_logo.svg.png';
-
 const TRACKER_INTERVAL_MS = 10_000;
-const MAX_STREAMS_PER_MESSAGE = 9; // 1 header embed + 9 session embeds = 10
+const MAX_STREAMS_PER_MESSAGE = 9;
 const MAX_FILES_PER_MESSAGE = 10;
+const STATS_TTL_MS = 5 * 60 * 1000;
 const TRACKER_STATE_FILE = path.join(process.cwd(), '.tracker-state.json');
+
+/* Logo (author icon) */
+const LOGO_PATH = path.join(process.cwd(), 'assets', 'jellyfin-logo.png');
+const LOGO_ATTACHMENT_NAME = 'jellyfin-logo.png';
+let logoBuffer: Buffer | null = null;
+try {
+  logoBuffer = fs.readFileSync(LOGO_PATH);
+  console.log(`[Jellyfin] Loaded logo (${logoBuffer.length} bytes) from ${LOGO_PATH}`);
+} catch {
+  console.warn(`[Jellyfin] Logo not found at ${LOGO_PATH} — embeds will render without an icon`);
+}
+
+function logoAttachment(): AttachmentBuilder | null {
+  return logoBuffer ? new AttachmentBuilder(logoBuffer, { name: LOGO_ATTACHMENT_NAME }) : null;
+}
+
+/* ANSI helpers */
+const A = {
+  reset: '\u001b[0m',
+  dim: '\u001b[2m',
+  gray: '\u001b[2;37m',
+  white: '\u001b[1;37m',
+  green: '\u001b[1;32m',
+  yellow: '\u001b[1;33m',
+  cyan: '\u001b[1;36m',
+  red: '\u001b[1;31m',
+};
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 /* ══════════════════════════════════════════════════════════════════════
-   GENERIC HELPERS
+   HELPERS
    ══════════════════════════════════════════════════════════════════════ */
 
 function getJellyfinBaseUrl(): string {
@@ -59,14 +88,18 @@ function jellyfinHeaders(): Record<string, string> {
   return { 'X-Emby-Authorization': `MediaBrowser Token="${process.env.JELLYFIN_API_KEY ?? ''}"` };
 }
 
-/** Smooth gradient progress bar. */
-function createProgressBar(percent: number, length = 22): string {
+function withApiKey(url: string): string {
+  const key = process.env.JELLYFIN_API_KEY;
+  if (!key) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}`;
+}
+
+function createProgressBar(percent: number, length = 14): string {
   const safe = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
   const filled = Math.round((safe / 100) * length);
   return '▰'.repeat(filled) + '▱'.repeat(Math.max(0, length - filled));
 }
 
-/** `1:02:03` / `42:17` */
 function formatTime(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds));
   const h = Math.floor(s / 3600);
@@ -75,16 +108,6 @@ function formatTime(totalSeconds: number): string {
   const mm = String(m).padStart(2, '0');
   const ss = String(sec).padStart(2, '0');
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
-}
-
-/** `1h 24m` / `18m` / `42s` */
-function formatDuration(totalSeconds: number): string {
-  const s = Math.max(0, Math.floor(totalSeconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m`;
-  return `${s}s`;
 }
 
 function truncate(text: string, max: number): string {
@@ -97,7 +120,7 @@ function codeBlock(content: string, language = 'bash', max = 3800): string {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
-   PROXMOX SSH LAYER
+   SSH
    ══════════════════════════════════════════════════════════════════════ */
 
 async function executeSsh(command: string): Promise<string> {
@@ -149,23 +172,120 @@ async function executeSsh(command: string): Promise<string> {
   });
 }
 
-/** Cache of LXC metadata so button handlers can show friendly names. */
 const lxcCache = new Map<string, { name: string; status: string; node?: string }>();
 
-function dockerUpdateCommand(dir: string): string {
-  const safeDir = dir.replace(/'/g, `'\\''`);
-  return `pct exec {{VMID}} -- bash -lc 'cd ${safeDir} && docker compose pull && docker compose up -d --remove-orphans && docker image prune -f'`;
+/* ══════════════════════════════════════════════════════════════════════
+   JELLYFIN — IMAGE FETCHING
+   ══════════════════════════════════════════════════════════════════════ */
+
+interface FetchedImage {
+  buffer: Buffer;
+  ext: string;
+  name: string;
+}
+
+async function fetchJellyfinImage(
+  url: string,
+  label: string,
+  fileName: string,
+): Promise<FetchedImage | null> {
+  try {
+    const res = await fetch(withApiKey(url), { headers: jellyfinHeaders() });
+    if (!res.ok) {
+      console.warn(`[Image] ${label} → HTTP ${res.status} ${res.statusText}`);
+      return null;
+    }
+    const ct = (res.headers.get('content-type') ?? '').toLowerCase();
+    const ext = ct.includes('png')
+      ? 'png'
+      : ct.includes('webp')
+        ? 'webp'
+        : ct.includes('gif')
+          ? 'gif'
+          : ct.includes('jpeg') || ct.includes('jpg')
+            ? 'jpg'
+            : 'png';
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (buffer.length === 0) {
+      console.warn(`[Image] ${label} → empty body`);
+      return null;
+    }
+    return { buffer, ext, name: `${fileName}.${ext}` };
+  } catch (err) {
+    console.warn(`[Image] ${label} → fetch error:`, err);
+    return null;
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
-   JELLYFIN TRACKER ENGINE
+   JELLYFIN — LIBRARY STATS
+   ══════════════════════════════════════════════════════════════════════ */
+
+interface LibraryStats {
+  movies: number;
+  series: number;
+  episodes: number;
+  users: number;
+  version: string;
+}
+
+let statsCache: { data: LibraryStats; fetchedAt: number } | null = null;
+
+async function getLibraryStats(baseUrl: string): Promise<LibraryStats | null> {
+  if (statsCache && Date.now() - statsCache.fetchedAt < STATS_TTL_MS) return statsCache.data;
+  try {
+    const [countsRes, usersRes, infoRes] = await Promise.all([
+      fetch(`${baseUrl}/Items/Counts`, { headers: jellyfinHeaders() }),
+      fetch(`${baseUrl}/Users`, { headers: jellyfinHeaders() }),
+      fetch(`${baseUrl}/System/Info`, { headers: jellyfinHeaders() }),
+    ]);
+
+    const counts = countsRes.ok ? await countsRes.json() : {};
+    const users = usersRes.ok ? await usersRes.json() : [];
+    const info = infoRes.ok ? await infoRes.json() : {};
+
+    const data: LibraryStats = {
+      movies: Number(counts?.MovieCount ?? 0),
+      series: Number(counts?.SeriesCount ?? 0),
+      episodes: Number(counts?.EpisodeCount ?? 0),
+      users: Array.isArray(users) ? users.length : 0,
+      version: String(info?.Version ?? '?').split('.')[0] || '?',
+    };
+    statsCache = { data, fetchedAt: Date.now() };
+    return data;
+  } catch (err) {
+    console.warn('[Stats] fetch failed:', err);
+    return statsCache?.data ?? null;
+  }
+}
+
+function buildStatsBlock(stats: LibraryStats | null, activeCount: number): string {
+  const line = (label: string, value: string | number, color = A.green) =>
+    `${A.gray}${label.padEnd(16, ' ')}${A.reset}${color}${String(value).padStart(6, ' ')}${A.reset}`;
+
+  const rows = stats
+    ? [
+        line('Movies', stats.movies),
+        line('Series', stats.series),
+        line('Episodes', stats.episodes),
+        `${A.dim}─────────────────────────${A.reset}`,
+        line('Users', stats.users, A.cyan),
+        line('Active Sessions', activeCount, activeCount > 0 ? A.yellow : A.gray),
+        line('Jellyfin Version', stats.version, A.white),
+      ]
+    : [line('Active Sessions', activeCount, activeCount > 0 ? A.yellow : A.gray)];
+
+  return ['```ansi', ...rows, '```'].join('\n');
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   JELLYFIN — TRACKER (COMPONENTS V2)
    ══════════════════════════════════════════════════════════════════════ */
 
 interface TrackerEntry {
   message: Message;
   timer: NodeJS.Timeout;
 }
-
 const trackers = new Map<string, TrackerEntry>();
 
 function readTrackerState(): { channelId: string; messageId: string }[] {
@@ -188,179 +308,166 @@ function persistTrackerState(): void {
   }
 }
 
-async function fetchImage(url: string): Promise<Buffer | null> {
-  try {
-    const res = await fetch(url, { headers: jellyfinHeaders() });
-    if (!res.ok) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    return buf.length > 0 ? buf : null;
-  } catch {
-    return null;
-  }
-}
-
 interface TrackerPayload {
-  embeds: EmbedBuilder[];
+  components: ContainerBuilder[];
   files: AttachmentBuilder[];
-  hash: string;
+  flags: number;
 }
 
-async function buildTrackerPayload(baseUrl: string): Promise<TrackerPayload> {
-  const res = await fetch(`${baseUrl}/Sessions`, { headers: jellyfinHeaders() });
-  if (!res.ok) throw new Error(`Jellyfin returned HTTP ${res.status}`);
-  const sessions: any[] = await res.json();
-
+async function buildTrackerComponents(baseUrl: string): Promise<TrackerPayload> {
+  const [sessionsRes, stats] = await Promise.all([
+    fetch(`${baseUrl}/Sessions`, { headers: jellyfinHeaders() }),
+    getLibraryStats(baseUrl),
+  ]);
+  if (!sessionsRes.ok) throw new Error(`Jellyfin returned HTTP ${sessionsRes.status}`);
+  const sessions: any[] = await sessionsRes.json();
   const active = sessions.filter((s) => s?.NowPlayingItem);
-
-  /* ── Idle state ─────────────────────────────────────────────────── */
-  if (active.length === 0) {
-    const idle = new EmbedBuilder()
-      .setColor(COLORS.neutral)
-      .setAuthor({ name: 'Jellyfin • Live Activity', iconURL: JELLYFIN_LOGO })
-      .setTitle('💤  Server is idle')
-      .setDescription('No one is streaming right now.\n*This panel refreshes itself automatically.*')
-      .setFooter({ text: '🔄 Auto-refresh every 10s' });
-
-    return { embeds: [idle], files: [], hash: 'idle' };
-  }
-
   const visible = active.slice(0, MAX_STREAMS_PER_MESSAGE);
 
-  /* ── Pre-fetch artwork (posters get priority over avatars) ───────── */
   const files: AttachmentBuilder[] = [];
-  const posterNames = new Map<number, string>();
-  const avatarNames = new Map<number, string>();
+  const usedNames = new Set<string>();
 
-  const posterJobs = visible.map(async (session, i) => {
-    const item = session.NowPlayingItem;
-    const imageId = item.Type === 'Episode' && item.SeriesId ? item.SeriesId : item.Id;
-    if (!imageId) return;
-    const buf = await fetchImage(`${baseUrl}/Items/${imageId}/Images/Primary`);
-    if (!buf) return;
-    posterNames.set(i, { name: `poster_${imageId}.jpg`, buf } as any);
-  });
-  await Promise.all(posterJobs);
+  /* ── Fetch posters ───────────────────────────────────────────── */
+  const posterRefs = new Map<number, string>();
 
-  for (const [i, entry] of [...posterNames.entries()]) {
-    const { name, buf } = entry as unknown as { name: string; buf: Buffer };
-    if (files.length >= MAX_FILES_PER_MESSAGE) break;
-    if (files.some((f) => f.name === name)) continue;
-    files.push(new AttachmentBuilder(buf, { name }));
+  await Promise.all(
+    visible.map(async (session, i) => {
+      const item = session.NowPlayingItem;
+      const id = item.Type === 'Episode' && item.SeriesId ? item.SeriesId : item.Id;
+      if (!id) return;
+      const img = await fetchJellyfinImage(
+        `${baseUrl}/Items/${id}/Images/Primary`,
+        `poster[${i}] ${id}`,
+        `poster_${id}`,
+      );
+      if (!img) return;
+      posterRefs.set(i, `attachment://${img.name}`);
+      if (usedNames.has(img.name)) return;
+      if (files.length >= MAX_FILES_PER_MESSAGE) return;
+      files.push(new AttachmentBuilder(img.buffer, { name: img.name }));
+      usedNames.add(img.name);
+    }),
+  );
+
+  /* ── Build container — NO accent color = transparent glass look ─ */
+  const container = new ContainerBuilder();
+
+  /* Header */
+  const headerLines = [
+    `# Jellyfin — Now Playing`,
+    active.length === 0
+      ? `💤  *Server is idle — this panel refreshes itself.*`
+      : `**${active.length} active stream${active.length === 1 ? '' : 's'}**  ·  Last updated <t:${Math.floor(Date.now() / 1000)}:R>`,
+    '',
+    buildStatsBlock(stats, active.length),
+  ];
+
+  if (active.length > MAX_STREAMS_PER_MESSAGE) {
+    headerLines.push(`-# …and ${active.length - MAX_STREAMS_PER_MESSAGE} more hidden`);
   }
 
-  const avatarJobs = visible.map(async (session, i) => {
-    if (!session.UserId) return;
-    const buf = await fetchImage(`${baseUrl}/Users/${session.UserId}/Images/Primary`);
-    if (!buf) return;
-    avatarNames.set(i, { name: `avatar_${session.UserId}.jpg`, buf } as any);
-  });
-  await Promise.all(avatarJobs);
+  container.addTextDisplayComponents(new TextDisplayBuilder().setContent(headerLines.join('\n')));
 
-  for (const entry of avatarNames.values()) {
-    const { name, buf } = entry as unknown as { name: string; buf: Buffer };
-    if (files.length >= MAX_FILES_PER_MESSAGE) break;
-    if (files.some((f) => f.name === name)) continue;
-    files.push(new AttachmentBuilder(buf, { name }));
+  if (visible.length > 0) {
+    container.addSeparatorComponents(
+      new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Large).setDivider(true),
+    );
   }
 
-  /* ── Build embeds ────────────────────────────────────────────────── */
-  const embeds: EmbedBuilder[] = [];
-
-  // Header
-  const header = new EmbedBuilder()
-    .setColor(COLORS.jellyfin)
-    .setAuthor({ name: 'Jellyfin • Live Activity', iconURL: JELLYFIN_LOGO })
-    .setDescription(
-      [
-        `### ▶️  ${active.length} active stream${active.length === 1 ? '' : 's'}`,
-        active.length > MAX_STREAMS_PER_MESSAGE
-          ? `-# Showing the first ${MAX_STREAMS_PER_MESSAGE} · ${active.length - MAX_STREAMS_PER_MESSAGE} more hidden`
-          : '-# Everyone is behaving… for now.',
-      ].join('\n'),
-    )
-    .setFooter({ text: '🔄 Auto-refresh every 10s' });
-
-  embeds.push(header);
-
+  /* One section per stream */
   for (const [i, session] of visible.entries()) {
     const item = session.NowPlayingItem;
     const playState = session.PlayState ?? {};
     const isPaused = Boolean(playState.IsPaused);
     const isTranscode = playState.PlayMethod === 'Transcode';
 
-    const seriesName: string | undefined = item.SeriesName;
-    const episodeTag =
-      item.Type === 'Episode'
-        ? [
-            item.ParentIndexNumber != null ? `S${String(item.ParentIndexNumber).padStart(2, '0')}` : null,
-            item.IndexNumber != null ? `E${String(item.IndexNumber).padStart(2, '0')}` : null,
-          ]
-            .filter(Boolean)
-            .join('')
-        : null;
-
-    const embedTitle = seriesName ?? item.Name ?? 'Unknown media';
+    const isEpisode = item.Type === 'Episode';
+    const mainTitle = isEpisode
+      ? item.SeriesName ?? item.Name ?? 'Unknown'
+      : item.Name ?? 'Unknown';
 
     const lines: string[] = [];
 
-    if (seriesName) {
-      lines.push(`**${episodeTag ? `${episodeTag} • ` : ''}${item.Name}**`);
+    /* Username */
+    lines.push(`**${session.UserName ?? 'Unknown'}**`);
+
+    /* Title */
+    lines.push(`## ${mainTitle}`);
+
+    /* Episode tag */
+    if (isEpisode && item.IndexNumber != null) {
+      const epTag = [
+        item.ParentIndexNumber != null
+          ? `S${String(item.ParentIndexNumber).padStart(2, '0')}`
+          : null,
+        `E${String(item.IndexNumber).padStart(2, '0')}`,
+      ]
+        .filter(Boolean)
+        .join('');
+      lines.push(`-# \`${epTag}\`  ·  *${item.Name ?? ''}*`);
     }
 
-    lines.push(
-      [
-        isPaused ? '⏸️ **Paused**' : '▶️ **Playing**',
-        isTranscode ? '⚠️ Transcoding' : '✅ Direct Play',
-      ].join('   ·   '),
-    );
-
+    /* Progress */
     const runtimeTicks: number = item.RunTimeTicks ?? 0;
     const positionTicks: number = playState.PositionTicks ?? 0;
-
     if (runtimeTicks > 0) {
       const cur = Math.floor(positionTicks / 10_000_000);
       const tot = Math.floor(runtimeTicks / 10_000_000);
       const pct = tot > 0 ? Math.min(100, Math.round((cur / tot) * 100)) : 0;
-      const left = Math.max(0, tot - cur);
-
-      lines.push('');
-      lines.push(`\`${createProgressBar(pct)}\``);
-      lines.push(`⏱️ \`${formatTime(cur)} / ${formatTime(tot)}\`   ·   ⏳ **${formatDuration(left)}** left   ·   \`${pct}%\``);
+      lines.push(
+        `${isPaused ? '⏸️' : '▶️'}  \`${createProgressBar(pct, 14)}\`  **${pct}%**  ·  \`${formatTime(cur)} / ${formatTime(tot)}\``,
+      );
+    } else {
+      lines.push(isPaused ? '⏸️  **Paused**' : '▶️  **Playing**');
     }
 
-    // Transcoding details (compact)
-    const t = session.TranscodingInfo;
-    if (isTranscode && t) {
-      const bits: string[] = [];
-      if (t.VideoCodec) bits.push(`🎞️ ${String(t.VideoCodec).toUpperCase()}`);
-      if (t.AudioCodec) bits.push(`🔊 ${String(t.AudioCodec).toUpperCase()}`);
-      if (t.Bitrate) bits.push(`📶 ${Math.round(t.Bitrate / 1000)} kbps`);
-      if (bits.length) lines.push(bits.join('   ·   '));
+    /* Delivery + client + tech */
+    const techBits: string[] = [
+      isTranscode ? '⚠️ Transcode' : '✅ Direct Play',
+      session.Client ? session.Client : null,
+    ].filter(Boolean) as string[];
+
+    if (isTranscode && session.TranscodingInfo) {
+      const t = session.TranscodingInfo;
+      if (t.VideoCodec) techBits.push(String(t.VideoCodec).toUpperCase());
+      if (t.AudioCodec) techBits.push(String(t.AudioCodec).toUpperCase());
+      if (t.Bitrate) techBits.push(`${Math.round(t.Bitrate / 1000)} kbps`);
     }
 
-    const embed = new EmbedBuilder()
-      .setColor(isPaused ? COLORS.paused : isTranscode ? COLORS.warn : COLORS.jellyfinLive)
-      .setTitle(truncate(embedTitle, 250))
-      .setDescription(truncate(lines.join('\n'), 4000));
+    lines.push(`-# ${techBits.join('  ·  ')}`);
 
-    // Author = user + client (+ avatar)
-    const authorName = `${session.UserName ?? 'Unknown'}  ·  ${session.Client ?? 'Unknown client'}`;
-    const avatarEntry = avatarNames.get(i) as unknown as { name: string } | undefined;
-    embed.setAuthor(avatarEntry ? { name: authorName, iconURL: `attachment://${avatarEntry.name}` } : { name: authorName });
+    const section = new SectionBuilder().addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(lines.join('\n')),
+    );
 
-    // Thumbnail = poster
-    const posterEntry = posterNames.get(i) as unknown as { name: string } | undefined;
-    if (posterEntry) embed.setThumbnail(`attachment://${posterEntry.name}`);
+    const poster = posterRefs.get(i);
+    if (poster) {
+      section.setThumbnailAccessory(new ThumbnailBuilder().setURL(poster));
+    }
 
-    embeds.push(embed);
+    container.addSectionComponents(section);
+
+    /* Separator between streams (not after the last one) */
+    if (i < visible.length - 1) {
+      container.addSeparatorComponents(
+        new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Large).setDivider(true),
+      );
+    }
   }
 
-  const hash = JSON.stringify({
-    e: embeds.map((e) => e.toJSON()),
-    f: files.map((f) => f.name),
-  });
+  /* Footer */
+  if (visible.length > 0) {
+    container.addSeparatorComponents(
+      new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Large).setDivider(true),
+    );
+  }
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      `-# 🔄 Auto-refresh every 10s  ·  <t:${Math.floor(Date.now() / 1000)}:f>`,
+    ),
+  );
 
-  return { embeds, files, hash };
+  return { components: [container], files, flags: MessageFlags.IsComponentsV2 };
 }
 
 async function startTracker(channel: TextChannel, existingMessage?: Message): Promise<void> {
@@ -371,28 +478,58 @@ async function startTracker(channel: TextChannel, existingMessage?: Message): Pr
     throw new Error('Jellyfin is not configured correctly.');
   }
 
-  // Tear down any previous tracker on this channel
   const previous = trackers.get(channel.id);
   if (previous) {
     clearInterval(previous.timer);
     trackers.delete(channel.id);
   }
 
-  const placeholder = new EmbedBuilder()
-    .setColor(COLORS.neutral)
-    .setDescription('📡 *Connecting to Jellyfin…*');
+  const placeholderContainer = new ContainerBuilder().addTextDisplayComponents(
+    new TextDisplayBuilder().setContent('📡  *Connecting to Jellyfin…*'),
+  );
 
-  const message = existingMessage ?? (await channel.send({ embeds: [placeholder] }));
+  /* Pick an existing message only if it's already a V2 message. */
+  let message: Message;
+  if (existingMessage && existingMessage.flags.has(MessageFlags.IsComponentsV2)) {
+    message = existingMessage;
+  } else {
+    if (existingMessage) {
+      await existingMessage.delete().catch(() => {});
+    }
+    message = await channel.send({
+      components: [placeholderContainer],
+      flags: MessageFlags.IsComponentsV2,
+    });
+  }
 
   let lastHash = '';
 
   const refresh = async () => {
     try {
-      const payload = await buildTrackerPayload(baseUrl);
-      if (payload.hash === lastHash) return; // nothing changed → skip the edit
-      lastHash = payload.hash;
-      await message.edit({ embeds: payload.embeds, files: payload.files });
-    } catch (err) {
+      const payload = await buildTrackerComponents(baseUrl);
+
+      /* ── Hash that ignores the ever-changing timestamp ─────────
+         If only the "<t:...:R>" timestamp changed, the edit is skipped
+         entirely — no bytes uploaded, no connection churn. */
+      const rawHash = JSON.stringify({
+        c: payload.components.map((c) => c.toJSON()),
+        f: payload.files.map((f) => f.name),
+      });
+      const hash = rawHash.replace(/<t:\d+:[Rf]>/g, '<t:0:R>');
+
+      if (hash === lastHash) return;
+      lastHash = hash;
+
+      await message.edit({
+        components: payload.components,
+        files: payload.files,
+        flags: payload.flags,
+      });
+    } catch (err: any) {
+      /* HTTP/2 GOAWAY / socket resets are transient — the next tick
+         opens a fresh connection and succeeds. Don't spam the console. */
+      const code = err?.code ?? err?.cause?.code;
+      if (code === 'UND_ERR_SOCKET') return;
       console.error('[Tracker] refresh failed:', err);
     }
   };
@@ -426,7 +563,7 @@ async function resumeTrackers(): Promise<void> {
    ══════════════════════════════════════════════════════════════════════ */
 
 client.once(Events.ClientReady, async (readyClient) => {
-  console.log('🤖 Bot is online and running natively on macOS!');
+  console.log('🤖 Bot is online and running natively on Proxmox LXC!');
   console.log(`Logged in as ${readyClient.user.tag}`);
   await resumeTrackers();
 });
@@ -438,7 +575,6 @@ client.once(Events.ClientReady, async (readyClient) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() && !interaction.isStringSelectMenu() && !interaction.isButton()) return;
 
-  /* 🔒 Gatekeeper */
   if (interaction.user.id !== process.env.OWNER_ID) {
     if (interaction.isRepliable()) {
       await interaction.reply({ content: '⛔ Access denied.', ephemeral: true }).catch(() => {});
@@ -446,21 +582,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  /* ════════════════════════════════════════════════════════════════
-     /update-stack
-     ════════════════════════════════════════════════════════════════ */
+  /* ── /update-stack ────────────────────────────────────────────── */
   if (interaction.isChatInputCommand() && interaction.commandName === 'update-stack') {
     await interaction.deferReply();
     const vmid = interaction.options.getInteger('lxc_id', true);
     const composePath = interaction.options.getString('path') ?? '/root';
 
-    const embed = new EmbedBuilder()
-      .setAuthor({ name: 'Proxmox • Docker Stack', iconURL: undefined })
-      .setColor(COLORS.proxmox)
-      .setTitle(`🐳 Updating LXC ${vmid}`)
-      .setDescription(`Pulling images and recreating containers in \`${composePath}\`…`);
-
-    await interaction.editReply({ embeds: [embed] });
+    await interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLORS.neutral)
+          .setTitle(`🐳 Updating LXC ${vmid}`)
+          .setDescription(`Pulling images and recreating containers in \`${composePath}\`…`),
+      ],
+    });
 
     try {
       const dockerCmd = `cd '${composePath.replace(/'/g, `'\\''`)}' && docker compose pull && docker compose up -d --remove-orphans && docker image prune -f`;
@@ -472,8 +607,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             .setColor(COLORS.success)
             .setTitle('✅ Stack updated')
             .setDescription(`LXC **${vmid}** · \`${composePath}\``)
-            .addFields({ name: 'Output', value: codeBlock(result, 'bash', 1000) })
-            .setFooter({ text: 'docker compose pull && up -d && image prune' }),
+            .addFields({ name: 'Output', value: codeBlock(result, 'bash', 1000) }),
         ],
       });
     } catch (error: any) {
@@ -490,9 +624,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  /* ════════════════════════════════════════════════════════════════
-     /setup-proxmox
-     ════════════════════════════════════════════════════════════════ */
+  /* ── /setup-proxmox ───────────────────────────────────────────── */
   if (interaction.isChatInputCommand() && interaction.commandName === 'setup-proxmox') {
     await interaction.deferReply({ ephemeral: true });
 
@@ -505,7 +637,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // Cache metadata for later button presses
       for (const lxc of lxcs) {
         lxcCache.set(String(lxc.vmid), { name: lxc.name, status: lxc.status, node: lxc.node });
       }
@@ -526,7 +657,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
       const dashboard = new EmbedBuilder()
-        .setColor(COLORS.proxmox)
+        .setColor(COLORS.neutral)
         .setAuthor({ name: 'Proxmox VE' })
         .setTitle('🖥️  Container Control Center')
         .setDescription(
@@ -570,31 +701,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  /* ════════════════════════════════════════════════════════════════
-     Proxmox dropdown selection
-     ════════════════════════════════════════════════════════════════ */
+  /* ── Proxmox dropdown ─────────────────────────────────────────── */
   if (interaction.isStringSelectMenu() && interaction.customId === 'proxmox_lxc_select') {
     const vmid = interaction.values[0];
+    if (!vmid) return;
     const meta = lxcCache.get(vmid);
-    const label = meta ? `${meta.name}` : 'unknown';
 
     const buttonRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`pmx_start_${vmid}`).setLabel('Start').setEmoji('▶️').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`pmx_stop_${vmid}`).setLabel('Stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId(`pmx_update_${vmid}`)
-        .setLabel('Update Docker Stack')
-        .setEmoji('🐳')
-        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`pmx_update_${vmid}`).setLabel('Update Docker Stack').setEmoji('🐳').setStyle(ButtonStyle.Primary),
     );
 
     const embed = new EmbedBuilder()
-      .setColor(COLORS.proxmox)
+      .setColor(COLORS.neutral)
       .setAuthor({ name: 'Proxmox VE' })
       .setTitle(`⚙️  Managing LXC ${vmid}`)
       .setDescription(
         [
-          `**Container:** \`${label}\``,
+          `**Container:** \`${meta?.name ?? 'unknown'}\``,
           `**Status:** ${meta?.status === 'running' ? '🟢 Running' : '🔴 Stopped'}`,
           meta?.node ? `**Node:** \`${meta.node}\`` : null,
           '',
@@ -608,20 +733,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  /* ════════════════════════════════════════════════════════════════
-     Proxmox control buttons
-     ════════════════════════════════════════════════════════════════ */
+  /* ── Proxmox buttons ──────────────────────────────────────────── */
   if (interaction.isButton() && interaction.customId.startsWith('pmx_')) {
     const [, action, vmid] = interaction.customId.split('_');
+    if (!vmid) return;
     const meta = lxcCache.get(vmid);
     const label = meta ? `**${meta.name}** (\`${vmid}\`)` : `LXC **${vmid}**`;
 
     await interaction.update({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(COLORS.neutral)
-          .setDescription(`⏳ Running \`${action}\` on ${label}…`),
-      ],
+      embeds: [new EmbedBuilder().setColor(COLORS.neutral).setDescription(`⏳ Running \`${action}\` on ${label}…`)],
       components: [],
     });
 
@@ -629,22 +749,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (action === 'start') {
         await executeSsh(`pct start ${vmid}`);
         await interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(COLORS.success)
-              .setTitle('✅ Container started')
-              .setDescription(`${label} is now running.`),
-          ],
+          embeds: [new EmbedBuilder().setColor(COLORS.success).setTitle('✅ Container started').setDescription(`${label} is now running.`)],
         });
       } else if (action === 'stop') {
         await executeSsh(`pct stop ${vmid}`);
         await interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(COLORS.danger)
-              .setTitle('🛑 Container stopped')
-              .setDescription(`${label} has been shut down.`),
-          ],
+          embeds: [new EmbedBuilder().setColor(COLORS.danger).setTitle('🛑 Container stopped').setDescription(`${label} has been shut down.`)],
         });
       } else if (action === 'update') {
         const dockerCmd = `cd /root && docker compose pull && docker compose up -d --remove-orphans && docker image prune -f`;
@@ -673,9 +783,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  /* ════════════════════════════════════════════════════════════════
-     /setup-tracker
-     ════════════════════════════════════════════════════════════════ */
+  /* ── /setup-tracker ───────────────────────────────────────────── */
   if (interaction.isChatInputCommand() && interaction.commandName === 'setup-tracker') {
     let baseUrl: string;
     try {
@@ -692,7 +800,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     const textChannel = channel as TextChannel;
 
-    /* ── Confirmation ───────────────────────────────────────────── */
     const confirmationRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId('setup-tracker-clear-yes').setLabel('Yes, clear channel').setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId('setup-tracker-clear-no').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
@@ -758,10 +865,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
-    /* ── Post the guide ─────────────────────────────────────────── */
+    /* Guide embed (regular embed) — neutral gray, no purple */
     const guideEmbed = new EmbedBuilder()
-      .setColor(COLORS.jellyfin)
-      .setAuthor({ name: 'Jellyfin Media Server', iconURL: JELLYFIN_LOGO })
+      .setColor(COLORS.neutral)
+      .setAuthor({
+        name: 'Jellyfin Media Server',
+        ...(logoBuffer ? { iconURL: `attachment://${LOGO_ATTACHMENT_NAME}` } : {}),
+      })
       .setTitle('🍿  Welcome to the homelab')
       .setDescription('Your personal media library, streamed anywhere.')
       .addFields(
@@ -775,9 +885,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       )
       .setFooter({ text: 'Powered by Proxmox & Docker' });
 
-    await textChannel.send({ embeds: [guideEmbed] });
+    const guideFiles: AttachmentBuilder[] = [];
+    const logo = logoAttachment();
+    if (logo) guideFiles.push(logo);
 
-    /* ── Start the live tracker ─────────────────────────────────── */
+    await textChannel.send({ embeds: [guideEmbed], files: guideFiles });
+
+    /* Start the live tracker (V2) */
     try {
       await startTracker(textChannel);
       await interaction.editReply({
